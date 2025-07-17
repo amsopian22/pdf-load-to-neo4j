@@ -1,0 +1,27 @@
+# Core Dependencies
+neo4j>=5.0.0
+pdfplumber>=4.0.0
+python-dotenv>=1.0.0
+
+# Airflow (if running locally)
+apache-airflow>=2.7.0
+apache-airflow-providers-postgres>=5.0.0
+
+# Data Processing
+pandas>=1.5.0
+numpy>=1.24.0
+
+# Utilities
+click>=8.0.0
+colorama>=0.4.6
+tqdm>=4.64.0
+
+# Development Dependencies (optional)
+pytest>=7.0.0
+black>=23.0.0
+flake8>=5.0.0
+mypy>=1.0.0
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.0.0

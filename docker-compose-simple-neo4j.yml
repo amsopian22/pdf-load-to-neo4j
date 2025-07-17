@@ -1,0 +1,203 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  airflow-webserver:
+    build: .
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 8
+      AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 2
+      AIRFLOW__CORE__PARALLELISM: 8
+      # Neo4j connection variables
+      NEO4J_URI: neo4j://host.docker.internal:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: 12345!@#$%
+    command: bash -c "
+      mkdir -p /opt/airflow/dags &&
+      echo 'from datetime import datetime, timedelta
+import os
+import logging
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+default_args = {
+    \"owner\": \"admin\",
+    \"depends_on_past\": False,
+    \"start_date\": datetime(2024, 1, 1),
+    \"email_on_failure\": False,
+    \"email_on_retry\": False,
+    \"retries\": 1,
+    \"retry_delay\": timedelta(minutes=5),
+}
+
+def extract_and_load_to_neo4j(**context):
+    from neo4j import GraphDatabase
+    import os
+    
+    # Get Neo4j connection details from environment
+    neo4j_uri = os.getenv(\"NEO4J_URI\", \"neo4j://127.0.0.1:7687\")
+    neo4j_user = os.getenv(\"NEO4J_USER\", \"neo4j\")
+    neo4j_password = os.getenv(\"NEO4J_PASSWORD\", \"12345!@#$%\")
+    
+    logging.info(f\"Connecting to Neo4j at {neo4j_uri}\")
+    
+    try:
+        driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+        
+        with driver.session() as session:
+            # Test connection
+            result = session.run(\"RETURN \x27Connection successful\x27 as message\")
+            record = result.single()
+            logging.info(f\"✅ Neo4j connection: {record[\x27message\x27]}\")
+            
+            # Create sample document data
+            sample_documents = [
+                {
+                    \"filename\": \"SABARUDDIN_SK.pdf\",
+                    \"content\": \"KEPUTUSAN KEPALA DINAS PEMADAM KEBAKARAN Nomor: 01/2024 Tentang Pengangkatan SABARUDDIN sebagai Pegawai Negeri Sipil di Sub Bagian Umum dan Kepegawaian\",
+                    \"pages\": 2,
+                    \"file_size\": 2048,
+                    \"extraction_method\": \"sample_data\"
+                },
+                {
+                    \"filename\": \"YUDI_HARSOYO_SK.pdf\", 
+                    \"content\": \"SURAT KEPUTUSAN PENGANGKATAN YUDI HARSOYO Nomor: 02/2024 Sebagai Staf Sub Bagian Umum dan Kepegawaian Dinas Pemadam Kebakaran\",
+                    \"pages\": 1,
+                    \"file_size\": 1536,
+                    \"extraction_method\": \"sample_data\"
+                }
+            ]
+            
+            # Create constraints and indexes
+            session.run(\"CREATE CONSTRAINT document_filename_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.filename IS UNIQUE\")
+            session.run(\"CREATE INDEX document_content_fulltext IF NOT EXISTS FOR (d:Document) ON (d.content)\")
+            
+            # Load documents
+            for doc_data in sample_documents:
+                logging.info(f\"Loading document: {doc_data[\x27filename\x27]}\")
+                
+                session.run(\"\"\"
+                    MERGE (d:Document {filename: $filename})
+                    SET d.content = $content,
+                        d.pages = $pages,
+                        d.file_size = $file_size,
+                        d.extraction_method = $extraction_method,
+                        d.loaded_at = datetime(),
+                        d.content_length = size($content)
+                \"\"\", **doc_data)
+                
+                # Extract keywords
+                words = doc_data[\x27content\x27].lower().split()
+                keywords = [word.strip(\x27.,!?\";()[]{}\x27) for word in words if len(word) > 3]
+                
+                keyword_freq = {}
+                for keyword in keywords:
+                    if keyword.isalpha():
+                        keyword_freq[keyword] = keyword_freq.get(keyword, 0) + 1
+                
+                for keyword, frequency in list(keyword_freq.items())[:10]:
+                    session.run(\"\"\"
+                        MERGE (k:Keyword {word: $keyword})
+                        MERGE (d:Document {filename: $filename})
+                        MERGE (d)-[r:CONTAINS_KEYWORD]->(k)
+                        SET r.frequency = $frequency
+                    \"\"\", keyword=keyword, filename=doc_data[\x27filename\x27], frequency=frequency)
+            
+            # Get statistics
+            result = session.run(\"\"\"
+                MATCH (d:Document)
+                RETURN count(d) as total_documents, 
+                       sum(d.pages) as total_pages,
+                       sum(d.file_size) as total_size
+            \"\"\")
+            
+            stats = result.single()
+            logging.info(f\"Successfully loaded {stats[\x27total_documents\x27]} documents to Neo4j\")
+            
+        driver.close()
+        return True
+        
+    except Exception as e:
+        logging.error(f\"Error: {e}\")
+        raise
+
+dag = DAG(
+    \"pdf_to_neo4j_simple\",
+    default_args=default_args,
+    description=\"Simple PDF to Neo4j pipeline\",
+    schedule_interval=timedelta(hours=6),
+    catchup=False,
+    tags=[\"pdf\", \"neo4j\", \"test\"],
+)
+
+extract_load_task = PythonOperator(
+    task_id=\"extract_and_load_to_neo4j\",
+    python_callable=extract_and_load_to_neo4j,
+    dag=dag,
+)' > /opt/airflow/dags/pdf_to_neo4j_simple.py &&
+      airflow db init &&
+      airflow users create --username airflow --firstname Admin --lastname User --role Admin --email admin@example.com --password airflow &&
+      airflow webserver"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  airflow-scheduler:
+    build: .
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 8
+      AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 2
+      AIRFLOW__CORE__PARALLELISM: 8
+      # Neo4j connection variables
+      NEO4J_URI: neo4j://host.docker.internal:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: 12345!@#$%
+    command: bash -c "
+      mkdir -p /opt/airflow/dags &&
+      sleep 60 &&
+      airflow scheduler"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+volumes:
+  postgres-db-volume:
